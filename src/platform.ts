@@ -1,29 +1,26 @@
 import type { API, Characteristic, DynamicPlatformPlugin, Logging, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
+import mqtt from 'mqtt';
+import { AdafruitIOAccessory } from './platformAccessory.js';
+import { PLATFORM_NAME, PLUGIN_NAME, AIO_MQTT_HOST, AIO_MQTT_PORT, AIO_REST_BASE } from './settings.js';
 
-import { ExamplePlatformAccessory } from './platformAccessory.js';
-import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
+export interface AIOFeedConfig {
+  feedKey: string;       // e.g. "mydevice.temperature"
+  displayName: string;   // e.g. "Living Room Temp"
+  serviceType: string;   // e.g. "TemperatureSensor"
+}
 
-// This is only required when using Custom Services and Characteristics not support by HomeKit
-import { EveHomeKitTypes } from 'homebridge-lib/EveHomeKitTypes';
-
-/**
- * HomebridgePlatform
- * This class is the main constructor for your plugin, this is where you should
- * parse the user config and discover/register accessories with Homebridge.
- */
-export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
+export class AdafruitIOPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
-
-  // this is used to track restored cached accessories
   public readonly accessories: Map<string, PlatformAccessory> = new Map();
-  public readonly discoveredCacheUUIDs: string[] = [];
 
-  // This is only required when using Custom Services and Characteristics not support by HomeKit
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomServices: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomCharacteristics: any;
+  private mqttClient?: mqtt.MqttClient;
+  // Map of feed topic -> accessory, so incoming MQTT messages can be routed
+  private feedAccessoryMap: Map<string, AdafruitIOAccessory> = new Map();
+
+  private readonly aioUsername: string;
+  private readonly aioKey: string;
+  private readonly feeds: AIOFeedConfig[];
 
   constructor(
     public readonly log: Logging,
@@ -33,118 +30,187 @@ export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
 
-    // This is only required when using Custom Services and Characteristics not support by HomeKit
-    this.CustomServices = new EveHomeKitTypes(this.api).Services;
-    this.CustomCharacteristics = new EveHomeKitTypes(this.api).Characteristics;
+    this.aioUsername = config.username ?? '';
+    this.aioKey = config.key ?? '';
+    this.feeds = (config.feeds as AIOFeedConfig[]) ?? [];
+
+    if (!this.aioUsername || !this.aioKey) {
+      this.log.error('Adafruit IO username and key are required. Please configure the plugin.');
+      return;
+    }
 
     this.log.debug('Finished initializing platform:', this.config.name);
 
-    // When this event is fired it means Homebridge has restored all cached accessories from disk.
-    // Dynamic Platform plugins should only register new accessories after this event was fired,
-    // in order to ensure they weren't added to homebridge already. This event can also be used
-    // to start discovery of new accessories.
     this.api.on('didFinishLaunching', () => {
-      log.debug('Executed didFinishLaunching callback');
-      // run the method to discover / register your devices as accessories
+      this.log.debug('Executed didFinishLaunching callback');
       this.discoverDevices();
+      this.connectMQTT();
+    });
+
+    this.api.on('shutdown', () => {
+      this.mqttClient?.end();
     });
   }
 
-  /**
-   * This function is invoked when homebridge restores cached accessories from disk at startup.
-   * It should be used to set up event handlers for characteristics and update respective values.
-   */
   configureAccessory(accessory: PlatformAccessory) {
     this.log.info('Loading accessory from cache:', accessory.displayName);
-
-    // add the restored accessory to the accessories cache, so we can track if it has already been registered
     this.accessories.set(accessory.UUID, accessory);
   }
 
   /**
-   * This is an example method showing how to register discovered accessories.
-   * Accessories must only be registered once, previously created accessories
-   * must not be registered again to prevent "duplicate UUID" errors.
+   * Register each configured feed as a HomeKit accessory.
+   * Accessories already in the cache are restored; new ones are registered.
+   * Stale cached accessories (feeds removed from config) are unregistered.
    */
   discoverDevices() {
-    // EXAMPLE ONLY
-    // A real plugin you would discover accessories from the local network, cloud services
-    // or a user-defined array in the platform config.
-    const exampleDevices = [
-      {
-        exampleUniqueId: 'ABCD',
-        exampleDisplayName: 'Bedroom',
-      },
-      {
-        exampleUniqueId: 'EFGH',
-        exampleDisplayName: 'Kitchen',
-      },
-      {
-        // This is an example of a device which uses a Custom Service
-        exampleUniqueId: 'IJKL',
-        exampleDisplayName: 'Backyard',
-        CustomService: 'AirPressureSensor',
-      },
-    ];
+    const discoveredUUIDs: string[] = [];
 
-    // loop over the discovered devices and register each one if it has not already been registered
-    for (const device of exampleDevices) {
-      // generate a unique id for the accessory this should be generated from
-      // something globally unique, but constant, for example, the device serial
-      // number or MAC address
-      const uuid = this.api.hap.uuid.generate(device.exampleUniqueId);
+    for (const feedCfg of this.feeds) {
+      const uuid = this.api.hap.uuid.generate(feedCfg.feedKey);
+      discoveredUUIDs.push(uuid);
 
-      // see if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
-      const existingAccessory = this.accessories.get(uuid);
-
-      if (existingAccessory) {
-        // the accessory already exists
-        this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-
-        // if you need to update the accessory.context then you should run `api.updatePlatformAccessories`. e.g.:
-        // existingAccessory.context.device = device;
-        // this.api.updatePlatformAccessories([existingAccessory]);
-
-        // create the accessory handler for the restored accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, existingAccessory);
-
-        // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
-        // remove platform accessories when no longer present
-        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
-        // this.log.info('Removing existing accessory from cache:', existingAccessory.displayName);
+      const existing = this.accessories.get(uuid);
+      if (existing) {
+        this.log.info('Restoring existing accessory from cache:', existing.displayName);
+        existing.context.feedCfg = feedCfg;
+        this.api.updatePlatformAccessories([existing]);
+        const acc = new AdafruitIOAccessory(this, existing);
+        this.feedAccessoryMap.set(this.feedTopic(feedCfg.feedKey), acc);
       } else {
-        // the accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', device.exampleDisplayName);
+        this.log.info('Adding new accessory:', feedCfg.displayName);
+        const accessory = new this.api.platformAccessory(feedCfg.displayName, uuid);
+        accessory.context.feedCfg = feedCfg;
+        const acc = new AdafruitIOAccessory(this, accessory);
+        this.feedAccessoryMap.set(this.feedTopic(feedCfg.feedKey), acc);
 
-        // create a new accessory
-        const accessory = new this.api.platformAccessory(device.exampleDisplayName, uuid);
+        // Track in our map so stale-removal logic is consistent
+        this.accessories.set(uuid, accessory);
 
-        // store a copy of the device object in the `accessory.context`
-        // the `context` property can be used to store any data about the accessory you may need
-        accessory.context.device = device;
-
-        // create the accessory handler for the newly create accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, accessory);
-
-        // link the accessory to your platform
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       }
-
-      // push into discoveredCacheUUIDs
-      this.discoveredCacheUUIDs.push(uuid);
     }
 
-    // you can also deal with accessories from the cache which are no longer present by removing them from Homebridge
-    // for example, if your plugin logs into a cloud account to retrieve a device list, and a user has previously removed a device
-    // from this cloud account, then this device will no longer be present in the device list but will still be in the Homebridge cache
+    // Remove stale accessories
     for (const [uuid, accessory] of this.accessories) {
-      if (!this.discoveredCacheUUIDs.includes(uuid)) {
-        this.log.info('Removing existing accessory from cache:', accessory.displayName);
+      if (!discoveredUUIDs.includes(uuid)) {
+        this.log.info('Removing stale accessory from cache:', accessory.displayName);
         this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.accessories.delete(uuid);
       }
     }
+  }
+
+  /**
+   * Open a persistent MQTT connection to Adafruit IO and subscribe to all
+   * configured feed topics.
+   */
+  connectMQTT() {
+    this.log.info('Connecting to Adafruit IO MQTT broker...');
+
+    this.mqttClient = mqtt.connect({
+      host: AIO_MQTT_HOST,
+      port: AIO_MQTT_PORT,
+      protocol: 'mqtts',
+      username: this.aioUsername,
+      password: this.aioKey,
+    });
+
+    this.mqttClient.on('connect', () => {
+      this.log.info('Connected to Adafruit IO MQTT.');
+
+      // Subscribe to each configured feed.
+      // This runs on every (re)connect so subscriptions survive reconnects.
+      for (const feedCfg of this.feeds) {
+        const topic = this.feedTopic(feedCfg.feedKey);
+        this.mqttClient!.subscribe(topic, { qos: 1 }, (err) => {
+          if (err) {
+            this.log.error(`Failed to subscribe to ${topic}:`, err.message);
+          } else {
+            this.log.debug('Subscribed to feed topic:', topic);
+          }
+        });
+      }
+    });
+
+    this.mqttClient.on('message', (topic, payload) => {
+      const value = payload.toString();
+      this.log.debug(`MQTT message on ${topic}: ${value}`);
+      const acc = this.feedAccessoryMap.get(topic);
+      if (acc) {
+        acc.handleFeedUpdate(value);
+      }
+    });
+
+    this.mqttClient.on('error', (err) => {
+      this.log.error('MQTT error:', err.message);
+    });
+
+    this.mqttClient.on('reconnect', () => {
+      this.log.debug('MQTT reconnecting...');
+    });
+
+    this.mqttClient.on('offline', () => {
+      this.log.warn('MQTT client went offline.');
+    });
+  }
+
+  /**
+   * Publish a value back to a feed (for controllable accessories like switches).
+   */
+  publishFeedValue(feedKey: string, value: string) {
+    const topic = this.feedTopic(feedKey);
+    this.mqttClient?.publish(topic, value, { qos: 1 }, (err) => {
+      if (err) {
+        this.log.error(`Failed to publish to ${topic}:`, err.message);
+      } else {
+        this.log.debug(`Published "${value}" to ${topic}`);
+      }
+    });
+  }
+
+  /**
+   * Fetch the last known value for a feed via REST at startup.
+   */
+  async fetchLastValue(feedKey: string): Promise<string | null> {
+    const url = `${AIO_REST_BASE}/${this.aioUsername}/feeds/${feedKey}/data/last`;
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-AIO-Key': this.aioKey },
+      });
+      if (!res.ok) {
+        this.log.warn(`Could not fetch last value for feed "${feedKey}": HTTP ${res.status}`);
+        return null;
+      }
+      const json = await res.json() as { value: string };
+      return json.value ?? null;
+    } catch (e) {
+      this.log.error(`Error fetching last value for feed "${feedKey}":`, (e as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch all feeds for the configured AIO account.
+   */
+  async fetchAllFeeds(): Promise<{ key: string; name: string }[]> {
+    const url = `${AIO_REST_BASE}/${this.aioUsername}/feeds`;
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-AIO-Key': this.aioKey },
+      });
+      if (!res.ok) {
+        this.log.warn(`Could not fetch feeds: HTTP ${res.status}`);
+        return [];
+      }
+      const json = await res.json() as { key: string; name: string }[];
+      return json;
+    } catch (e) {
+      this.log.error('Error fetching feeds:', (e as Error).message);
+      return [];
+    }
+  }
+
+  private feedTopic(feedKey: string): string {
+    return `${this.aioUsername}/feeds/${feedKey}`;
   }
 }

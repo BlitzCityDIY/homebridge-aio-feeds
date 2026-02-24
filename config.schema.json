@@ -1,18 +1,81 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "AdafruitIOPlatform",
   "pluginType": "platform",
   "singular": true,
-  "strictValidation": false,
+  "strictValidation": true,
   "schema": {
     "type": "object",
-    "required": ["name"],
+    "required": ["username", "key"],
     "additionalProperties": false,
     "properties": {
       "name": {
-        "title": "Name",
+        "title": "Platform Name",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "default": "Homebridge Adafruit IO Feeds"
+      },
+      "username": {
+        "title": "Adafruit IO Username",
+        "type": "string",
+        "description": "Your Adafruit IO account username (not your email address)."
+      },
+      "key": {
+        "title": "Adafruit IO Key",
+        "type": "string",
+        "description": "Your Adafruit IO API key. Found at io.adafruit.com under the key icon."
+      },
+      "feeds": {
+        "title": "Feeds",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["feedKey", "displayName", "serviceType"],
+          "additionalProperties": false,
+          "properties": {
+            "feedKey": {
+              "title": "Feed Key",
+              "type": "string",
+              "description": "The feed key from Adafruit IO, e.g. 'mydevice.temperature' or 'onoff'."
+            },
+            "displayName": {
+              "title": "Display Name",
+              "type": "string",
+              "description": "The name shown in the Home app for this accessory."
+            },
+            "serviceType": {
+              "title": "HomeKit Service Type",
+              "type": "string",
+              "description": "How this feed should appear in HomeKit.",
+              "oneOf": [
+                { "title": "Temperature Sensor",             "enum": ["TemperatureSensor"] },
+                { "title": "Humidity Sensor",                "enum": ["HumiditySensor"] },
+                { "title": "Switch / Relay (controllable)",  "enum": ["Switch"] },
+                { "title": "Light Sensor (lux)",             "enum": ["LightSensor"] },
+                { "title": "Motion Sensor",                  "enum": ["MotionSensor"] },
+                { "title": "Contact Sensor",                 "enum": ["ContactSensor"] },
+                { "title": "CO₂ Sensor",                    "enum": ["CarbonDioxideSensor"] },
+                { "title": "CO Sensor",                     "enum": ["CarbonMonoxideSensor"] },
+                { "title": "Stateless Button",               "enum": ["StatelessProgrammableSwitch"] }
+              ]
+            }
+          }
+        }
       }
     }
-  }
+  },
+  "layout": [
+    { "key": "username" },
+    { "key": "key",      "type": "password" },
+    {
+      "key": "feeds",
+      "type": "array",
+      "title": "Feeds",
+      "description": "Add one entry per Adafruit IO feed you want to expose to HomeKit.",
+      "buttonText": "Add Feed",
+      "items": [
+        { "key": "feeds[].feedKey",     "title": "Feed Key" },
+        { "key": "feeds[].displayName", "title": "Display Name" },
+        { "key": "feeds[].serviceType", "title": "HomeKit Service Type", "type": "select" }
+      ]
+    }
+  ]
 }

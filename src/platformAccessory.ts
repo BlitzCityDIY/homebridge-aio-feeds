@@ -1,148 +1,273 @@
 import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
-
-import type { ExampleHomebridgePlatform } from './platform.js';
+import type { AdafruitIOPlatform, AIOFeedConfig } from './platform.js';
 
 /**
- * Platform Accessory
- * An instance of this class is created for each accessory your platform registers
- * Each accessory may expose multiple services of different service types.
+ * A "strategy" that knows how to set up HomeKit characteristics and
+ * apply incoming feed values for a particular service type.
  */
-export class ExamplePlatformAccessory {
-  private service: Service;
+interface ServiceTypeHandler {
+  getServiceClass: (platform: AdafruitIOPlatform) => typeof Service.Switch;
+  setup: (ctx: AccessoryContext) => void;
+  apply: (ctx: AccessoryContext, raw: string) => void;
+}
 
-  /**
-   * These are just used to create a working example
-   * You should implement your own code to track the state of your accessory
-   */
-  private exampleStates = {
-    On: false,
-    Brightness: 100,
-  };
+/**
+ * Shared context passed to each handler so it can read/write cached
+ * values and push updates without reaching back into the accessory.
+ */
+interface AccessoryContext {
+  platform: AdafruitIOPlatform;
+  service: Service;
+  cached: Record<string, CharacteristicValue>;
+  feedKey: string;
+}
+
+// ---------------------------------------------------------------------------
+// Handler registry – keeps setup and apply logic together per service type
+// ---------------------------------------------------------------------------
+
+const handlers: Record<string, ServiceTypeHandler> = {
+  TemperatureSensor: {
+    getServiceClass: (p) => p.Service.TemperatureSensor,
+    setup(ctx) {
+      ctx.cached.value = 0;
+      ctx.service
+        .getCharacteristic(ctx.platform.Characteristic.CurrentTemperature)
+        .onGet(() => ctx.cached.value);
+    },
+    apply(ctx, raw) {
+      const temp = parseFloat(raw);
+      if (!isNaN(temp)) {
+        ctx.cached.value = temp;
+        ctx.service.updateCharacteristic(ctx.platform.Characteristic.CurrentTemperature, temp);
+      }
+    },
+  },
+
+  HumiditySensor: {
+    getServiceClass: (p) => p.Service.HumiditySensor,
+    setup(ctx) {
+      ctx.cached.value = 0;
+      ctx.service
+        .getCharacteristic(ctx.platform.Characteristic.CurrentRelativeHumidity)
+        .onGet(() => ctx.cached.value);
+    },
+    apply(ctx, raw) {
+      const hum = parseFloat(raw);
+      if (!isNaN(hum)) {
+        ctx.cached.value = hum;
+        ctx.service.updateCharacteristic(ctx.platform.Characteristic.CurrentRelativeHumidity, hum);
+      }
+    },
+  },
+
+  LightSensor: {
+    getServiceClass: (p) => p.Service.LightSensor,
+    setup(ctx) {
+      ctx.cached.value = 0.0001; // HomeKit minimum lux
+      ctx.service
+        .getCharacteristic(ctx.platform.Characteristic.CurrentAmbientLightLevel)
+        .onGet(() => ctx.cached.value);
+    },
+    apply(ctx, raw) {
+      const parsed = parseFloat(raw);
+      if (isNaN(parsed)) {
+        return;
+      }              // guard before clamping
+      const lux = Math.max(0.0001, parsed);
+      ctx.cached.value = lux;
+      ctx.service.updateCharacteristic(ctx.platform.Characteristic.CurrentAmbientLightLevel, lux);
+    },
+  },
+
+  MotionSensor: {
+    getServiceClass: (p) => p.Service.MotionSensor,
+    setup(ctx) {
+      ctx.cached.value = false;
+      ctx.service
+        .getCharacteristic(ctx.platform.Characteristic.MotionDetected)
+        .onGet(() => ctx.cached.value);
+    },
+    apply(ctx, raw) {
+      const detected = raw === '1' || raw.toLowerCase() === 'true' || raw.toLowerCase() === 'on';
+      ctx.cached.value = detected;
+      ctx.service.updateCharacteristic(ctx.platform.Characteristic.MotionDetected, detected);
+    },
+  },
+
+  ContactSensor: {
+    getServiceClass: (p) => p.Service.ContactSensor,
+    setup(ctx) {
+      ctx.cached.value = ctx.platform.Characteristic.ContactSensorState.CONTACT_DETECTED;
+      ctx.service
+        .getCharacteristic(ctx.platform.Characteristic.ContactSensorState)
+        .onGet(() => ctx.cached.value);
+    },
+    apply(ctx, raw) {
+      const C = ctx.platform.Characteristic;
+      const contact = (raw === '1' || raw.toLowerCase() === 'true' || raw.toLowerCase() === 'on')
+        ? C.ContactSensorState.CONTACT_DETECTED
+        : C.ContactSensorState.CONTACT_NOT_DETECTED;
+      ctx.cached.value = contact;
+      ctx.service.updateCharacteristic(C.ContactSensorState, contact);
+    },
+  },
+
+  CarbonDioxideSensor: {
+    getServiceClass: (p) => p.Service.CarbonDioxideSensor,
+    setup(ctx) {
+      const C = ctx.platform.Characteristic;
+      ctx.cached.detected = C.CarbonDioxideDetected.CO2_LEVELS_NORMAL;
+      ctx.cached.level = 0;
+      ctx.service.getCharacteristic(C.CarbonDioxideDetected)
+        .onGet(() => ctx.cached.detected);
+      ctx.service.getCharacteristic(C.CarbonDioxideLevel)
+        .onGet(() => ctx.cached.level);
+    },
+    apply(ctx, raw) {
+      const C = ctx.platform.Characteristic;
+      const ppm = parseFloat(raw);
+      if (isNaN(ppm)) {
+        return;
+      }
+      const detected = ppm > 1000
+        ? C.CarbonDioxideDetected.CO2_LEVELS_ABNORMAL
+        : C.CarbonDioxideDetected.CO2_LEVELS_NORMAL;
+      ctx.cached.detected = detected;
+      ctx.cached.level = ppm;
+      ctx.service.updateCharacteristic(C.CarbonDioxideDetected, detected);
+      ctx.service.updateCharacteristic(C.CarbonDioxideLevel, ppm);
+    },
+  },
+
+  CarbonMonoxideSensor: {
+    getServiceClass: (p) => p.Service.CarbonMonoxideSensor,
+    setup(ctx) {
+      const C = ctx.platform.Characteristic;
+      ctx.cached.detected = C.CarbonMonoxideDetected.CO_LEVELS_NORMAL;
+      ctx.cached.level = 0;
+      ctx.service.getCharacteristic(C.CarbonMonoxideDetected)
+        .onGet(() => ctx.cached.detected);
+      ctx.service.getCharacteristic(C.CarbonMonoxideLevel)
+        .onGet(() => ctx.cached.level);
+    },
+    apply(ctx, raw) {
+      const C = ctx.platform.Characteristic;
+      const ppm = parseFloat(raw);
+      if (isNaN(ppm)) {
+        return;
+      }
+      const detected = ppm > 35
+        ? C.CarbonMonoxideDetected.CO_LEVELS_ABNORMAL
+        : C.CarbonMonoxideDetected.CO_LEVELS_NORMAL;
+      ctx.cached.detected = detected;
+      ctx.cached.level = ppm;
+      ctx.service.updateCharacteristic(C.CarbonMonoxideDetected, detected);
+      ctx.service.updateCharacteristic(C.CarbonMonoxideLevel, ppm);
+    },
+  },
+
+  StatelessProgrammableSwitch: {
+    getServiceClass: (p) => p.Service.StatelessProgrammableSwitch,
+    setup() {
+      // Read-only: no onGet/onSet, events are pushed via updateCharacteristic
+    },
+    apply(ctx) {
+      const C = ctx.platform.Characteristic;
+      ctx.service.updateCharacteristic(
+        C.ProgrammableSwitchEvent,
+        C.ProgrammableSwitchEvent.SINGLE_PRESS,
+      );
+    },
+  },
+
+  Switch: {
+    getServiceClass: (p) => p.Service.Switch,
+    setup(ctx) {
+      ctx.cached.value = false;
+      ctx.service
+        .getCharacteristic(ctx.platform.Characteristic.On)
+        .onGet(() => ctx.cached.value)
+        .onSet((value: CharacteristicValue) => {
+          ctx.cached.value = value;
+          const payload = (value as boolean) ? '1' : '0';
+          ctx.platform.publishFeedValue(ctx.feedKey, payload);
+        });
+    },
+    apply(ctx, raw) {
+      const on = raw === '1' || raw.toLowerCase() === 'true' || raw.toLowerCase() === 'on';
+      ctx.cached.value = on;
+      ctx.service.updateCharacteristic(ctx.platform.Characteristic.On, on);
+    },
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Accessory class
+// ---------------------------------------------------------------------------
+
+/**
+ * Represents a single Adafruit IO feed mapped to a HomeKit accessory service.
+ * On construction it fetches the last known value via REST to seed initial state,
+ * then stays up-to-date via MQTT messages routed from the platform.
+ */
+export class AdafruitIOAccessory {
+  private service: Service;
+  private feedCfg: AIOFeedConfig;
+  private handler: ServiceTypeHandler;
+  private ctx: AccessoryContext;
 
   constructor(
-    private readonly platform: ExampleHomebridgePlatform,
+    private readonly platform: AdafruitIOPlatform,
     private readonly accessory: PlatformAccessory,
   ) {
-    // set accessory information
+    this.feedCfg = accessory.context.feedCfg as AIOFeedConfig;
+
+    // Set accessory information service
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Default-Manufacturer')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Default-Model')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Default-Serial');
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Adafruit')
+      .setCharacteristic(this.platform.Characteristic.Model, this.feedCfg.serviceType)
+      .setCharacteristic(this.platform.Characteristic.SerialNumber, this.feedCfg.feedKey);
 
-    // get the LightBulb service if it exists, otherwise create a new LightBulb service
-    // you can create multiple services for each accessory
+    // Resolve handler (fall back to Switch for unknown types)
+    this.handler = handlers[this.feedCfg.serviceType] ?? handlers.Switch;
 
-    if (accessory.context.device.CustomService) {
-      // This is only required when using Custom Services and Characteristics not support by HomeKit
-      this.service = this.accessory.getService(this.platform.CustomServices[accessory.context.device.CustomService]) ||
-        this.accessory.addService(this.platform.CustomServices[accessory.context.device.CustomService]);
-    } else {
-      this.service = this.accessory.getService(this.platform.Service.Lightbulb) || this.accessory.addService(this.platform.Service.Lightbulb);
-    }
+    this.service = this.getOrAddService();
+    this.service.setCharacteristic(this.platform.Characteristic.Name, this.feedCfg.displayName);
 
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.exampleDisplayName);
+    // Build shared context for the handler
+    this.ctx = {
+      platform: this.platform,
+      service: this.service,
+      cached: {},
+      feedKey: this.feedCfg.feedKey,
+    };
 
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
+    this.handler.setup(this.ctx);
 
-    // register handlers for the On/Off Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setOn.bind(this)) // SET - bind to the `setOn` method below
-      .onGet(this.getOn.bind(this)); // GET - bind to the `getOn` method below
-
-    // register handlers for the Brightness Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.Brightness)
-      .onSet(this.setBrightness.bind(this)); // SET - bind to the `setBrightness` method below
-
-    /**
-     * Creating multiple services of the same type.
-     *
-     * To avoid "Cannot add a Service with the same UUID another Service without also defining a unique 'subtype' property." error,
-     * when creating multiple services of the same type, you need to use the following syntax to specify a name and subtype id:
-     * this.accessory.getService('NAME') || this.accessory.addService(this.platform.Service.Lightbulb, 'NAME', 'USER_DEFINED_SUBTYPE_ID');
-     *
-     * The USER_DEFINED_SUBTYPE must be unique to the platform accessory (if you platform exposes multiple accessories, each accessory
-     * can use the same subtype id.)
-     */
-
-    // Example: add two "motion sensor" services to the accessory
-    const motionSensorOneService = this.accessory.getService('Motion Sensor One Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor One Name', 'YourUniqueIdentifier-1');
-
-    const motionSensorTwoService = this.accessory.getService('Motion Sensor Two Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor Two Name', 'YourUniqueIdentifier-2');
-
-    /**
-     * Updating characteristics values asynchronously.
-     *
-     * Example showing how to update the state of a Characteristic asynchronously instead
-     * of using the `on('get')` handlers.
-     * Here we change update the motion sensor trigger states on and off every 10 seconds
-     * the `updateCharacteristic` method.
-     *
-     */
-    let motionDetected = false;
-    setInterval(() => {
-      // EXAMPLE - inverse the trigger
-      motionDetected = !motionDetected;
-
-      // push the new value to HomeKit
-      motionSensorOneService.updateCharacteristic(this.platform.Characteristic.MotionDetected, motionDetected);
-      motionSensorTwoService.updateCharacteristic(this.platform.Characteristic.MotionDetected, !motionDetected);
-
-      this.platform.log.debug('Triggering motionSensorOneService:', motionDetected);
-      this.platform.log.debug('Triggering motionSensorTwoService:', !motionDetected);
-    }, 10000);
+    // Seed initial state from REST
+    this.platform.fetchLastValue(this.feedCfg.feedKey).then((val) => {
+      if (val !== null) {
+        this.platform.log.debug(`Seeded "${this.feedCfg.feedKey}" with last value: ${val}`);
+        this.handler.apply(this.ctx, val);
+      }
+    });
   }
 
   /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, turning on a Light bulb.
+   * Called by the platform whenever an MQTT message arrives for this feed.
    */
-  async setOn(value: CharacteristicValue) {
-    // implement your own code to turn your device on/off
-    this.exampleStates.On = value as boolean;
-
-    this.platform.log.debug('Set Characteristic On ->', value);
+  handleFeedUpdate(rawValue: string) {
+    this.platform.log.debug(`Feed update for "${this.feedCfg.feedKey}": ${rawValue}`);
+    this.handler.apply(this.ctx, rawValue);
   }
 
-  /**
-   * Handle the "GET" requests from HomeKit
-   * These are sent when HomeKit wants to know the current state of the accessory, for example, checking if a Light bulb is on.
-   *
-   * GET requests should return as fast as possible. A long delay here will result in
-   * HomeKit being unresponsive and a bad user experience in general.
-   *
-   * If your device takes time to respond you should update the status of your device
-   * asynchronously instead using the `updateCharacteristic` method instead.
-   * In this case, you may decide not to implement `onGet` handlers, which may speed up
-   * the responsiveness of your device in the Home app.
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
 
-   * @example
-   * this.service.updateCharacteristic(this.platform.Characteristic.On, true)
-   */
-  async getOn(): Promise<CharacteristicValue> {
-    // implement your own code to check if the device is on
-    const isOn = this.exampleStates.On;
-
-    this.platform.log.debug('Get Characteristic On ->', isOn);
-
-    // if you need to return an error to show the device as "Not Responding" in the Home app:
-    // throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-
-    return isOn;
-  }
-
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, changing the Brightness
-   */
-  async setBrightness(value: CharacteristicValue) {
-    // implement your own code to set the brightness
-    this.exampleStates.Brightness = value as number;
-
-    this.platform.log.debug('Set Characteristic Brightness -> ', value);
+  private getOrAddService(): Service {
+    const ServiceClass = this.handler.getServiceClass(this.platform);
+    return this.accessory.getService(ServiceClass) || this.accessory.addService(ServiceClass);
   }
 }
